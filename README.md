@@ -49,20 +49,15 @@ character on the same map are each drawn with their own game's shaders.
 
 ## Installing (no terminal needed afterwards)
 
-Get the source — either `git clone https://github.com/VirstaXIV/FFLocal` or, without git,
-download and unzip a [release](https://github.com/VirstaXIV/FFLocal/tags) (any `vX.Y.Z` tag's
-"Source code (zip)" link) or the tip of `main`. Then build once with a Rust toolchain
-([rustup](https://rustup.rs)); nothing about the games is needed to build, and the result is a
-normal double-clickable program:
-
-| OS | Build | Result |
-|---|---|---|
-| Linux | `tools/package.sh` then `tools/install-desktop.sh` | "FFLocal" in the application menu (`~/.local/bin/fflocal` + `ffl-app`, `fflocal.desktop`) |
-| Windows | `tools\package.ps1` in PowerShell | `dist\windows\FFLocal.exe` — double-click it (no console window) |
-| macOS | `tools/package.sh` | `dist/macos/FFLocal.app` — open it or drag it to Applications |
-
-In a source checkout, `FFLocal.sh` (Linux/macOS) or `FFLocal.cmd` (Windows) at the top level
-is the double-clickable start: it builds the small launcher if needed and opens it.
+Install a Rust toolchain once ([rustup](https://rustup.rs)) — nothing about the games is
+needed to build. Then get the source: either `git clone
+https://github.com/VirstaXIV/FFLocal`, or without git, download and unzip a
+[release](https://github.com/VirstaXIV/FFLocal/tags) (any `vX.Y.Z` tag's "Source code (zip)"
+link) or the tip of `main`. That's it — double-click `FFLocal.sh` (Linux/macOS) or
+`FFLocal.cmd` (Windows) at the top level: it builds the small launcher if needed (a minute or
+two the first time) and opens it. Later starts are near-instant, and the launcher checks for
+updates and can apply them itself (see below), so there's no separate packaging or reinstall
+step.
 
 ### The launcher
 
@@ -70,17 +65,16 @@ What opens first is a small window, the **launcher** (`crates/ffl-launcher`, the
 program): it shows which games were found, lets you point at an install (type, **Browse…**
 or **Scan**), switch a game off entirely, set the basic graphics options (fullscreen, VSync,
 anti-aliasing, shadows, distances, UI scale) and the master volume, and then **Launch**
-starts the program (`ffl-app`). From a source checkout the launcher builds the program first
-and says so — the first build takes minutes, later ones seconds when nothing changed; an
-installed package starts at once. Everything the launcher sets is written to the same
+starts the program (`ffl-app`). The launcher builds the program first and says so — the first
+build takes minutes, later ones seconds when nothing changed. Everything the launcher sets is written to the same
 `settings.toml` the program reads, so the in-app **Games** and **Settings** windows show the
 same state. **Save** writes without starting; **Build** rebuilds without starting.
 
-In a source checkout, the launcher also checks `github.com/VirstaXIV/FFLocal`'s tags on
-startup; if a newer `vX.Y.Z` release exists it shows **Update available: vX.Y.Z** with a
-**Download & apply** button that downloads that tag's source, overlays it onto the checkout
-(local settings and build output are left alone) and rebuilds — no separate download step.
-Set `FFL_NO_UPDATE_CHECK=1` to skip the check entirely (e.g. offline).
+The launcher also checks `github.com/VirstaXIV/FFLocal`'s tags on startup; if a newer
+`vX.Y.Z` release exists it shows **Update available: vX.Y.Z** with a **Download & apply**
+button that downloads that tag's source, overlays it onto the checkout (local settings and
+build output are left alone) and rebuilds — no separate download step. Set
+`FFL_NO_UPDATE_CHECK=1` to skip the check entirely (e.g. offline).
 
 FFLocal reads the games in place and copies nothing: the program is about 130 MB, the
 launcher a few MB, and the data folder (presets, settings, log) a few KB. A source checkout

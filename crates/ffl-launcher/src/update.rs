@@ -14,7 +14,7 @@ const USER_AGENT: &str = "fflocal-launcher";
 
 /// Root-level paths an applied update must never touch: git metadata and everything
 /// `.gitignore` keeps out of the versioned tree (build output, local settings, logs).
-const PRESERVE: &[&str] = &[".git", "target", "dist", "screenshots", "config.toml"];
+const PRESERVE: &[&str] = &[".git", "target", "screenshots", "config.toml"];
 
 #[derive(serde::Deserialize)]
 struct Tag {

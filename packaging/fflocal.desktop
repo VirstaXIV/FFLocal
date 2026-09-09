@@ -1,9 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=FFLocal
-Comment=Worlds and characters from installed Final Fantasy games
-Exec=fflocal
-Icon=fflocal
-Terminal=false
-Categories=Game;
-StartupWMClass=fflocal
