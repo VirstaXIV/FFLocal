@@ -1,0 +1,24 @@
+[package]
+name = "ffl-cli"
+description = "Inspection CLI for FFLocal: game info, Excel, zones, models, character data."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "ffl-cli"
+path = "src/main.rs"
+
+[dependencies]
+ffl-core.workspace = true
+ffl-ff14-assets.workspace = true
+ffl-ff14-chara.workspace = true
+ffl-ff14.workspace = true
+ffl-ff11 = { path = "../../engines/ff11" }
+physis.workspace = true
+anyhow.workspace = true
+glam = "0.33"
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

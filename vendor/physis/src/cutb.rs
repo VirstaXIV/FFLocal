@@ -1,0 +1,176 @@
+// SPDX-FileCopyrightText: 2025 Joshua Goins <josh@redstrate.com>
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#![allow(unused_variables)] // binrw :-(
+
+use std::io::Cursor;
+use std::io::SeekFrom;
+
+use crate::ByteSpan;
+use crate::ReadableFile;
+use crate::common::Platform;
+use crate::common_file_operations::read_string;
+use crate::common_file_operations::read_string_until_null;
+use crate::common_file_operations::write_string;
+use crate::string_heap::StringHeap;
+use crate::tmb::TimelineNode;
+use binrw::BinRead;
+use binrw::binrw;
+
+#[binrw]
+#[br(import(name: &str, string_heap: &StringHeap))]
+#[bw(import(string_heap: &mut StringHeap))]
+#[derive(Debug)]
+pub enum NodeData {
+    #[br(pre_assert(name == "CTRL"))]
+    CTRL(CTRLNode),
+    #[br(pre_assert(name == "CTIS"))]
+    CTIS(CTISNode),
+    #[br(pre_assert(name == "CTDS"))]
+    CTDS(CTDSNode),
+    #[br(pre_assert(name == "CTTL"))]
+    CTTL(#[brw(args(string_heap,))] CTTLNode),
+    Unknown,
+}
+
+#[binrw]
+#[br(import(string_heap: &StringHeap))]
+#[bw(import(string_heap: &mut StringHeap))]
+#[derive(Debug)]
+pub struct CutsceneNode {
+    #[br(count = 4)]
+    #[bw(pad_size_to = 4)]
+    #[bw(map = write_string)]
+    #[br(map = read_string)]
+    pub name: String,
+    /// In bytes, the size of this node *including* the name.
+    size: u32,
+
+    /// Offset starting from the beginning of this field to the node information.
+    data_offset: u32,
+
+    #[br(seek_before = SeekFrom::Current(data_offset as i64 - 4))]
+    #[br(restore_position)]
+    #[br(args(&name, string_heap))]
+    #[bw(args(string_heap,))]
+    pub node_data: NodeData,
+
+    /// Size of the node's data *including* the node information.
+    data_size: u32,
+}
+
+#[binrw]
+#[derive(Debug)]
+pub struct StringNode {
+    #[br(temp)]
+    #[bw(ignore)]
+    offset: u32,
+
+    // TODO: we may be using offset wrong, unsure
+    #[br(seek_before = SeekFrom::Current(offset as i64 - 4))]
+    #[br(restore_position, parse_with = read_string_until_null)]
+    #[bw(ignore)]
+    pub value: String,
+
+    #[br(temp)]
+    #[bw(ignore)]
+    unk1: u32, // Seems to be either 255 or 0
+}
+
+/// Cutscene binary file, usually with the `.cutb` file extension.
+///
+/// Describes animated cutscenes to be played in-game.
+#[binrw]
+#[brw(magic = b"CUTB")]
+#[br(import(string_heap: &StringHeap))]
+#[bw(import(string_heap: &mut StringHeap))]
+#[derive(Debug)]
+pub struct Cutscene {
+    /// In bytes, including the header and the magic.
+    size_of_file: u32,
+    num_nodes: u32,
+    /// The nodes for this cutscene.
+    #[br(count = num_nodes, args { inner: (string_heap,) })]
+    //#[bw(args(string_heap,))]
+    #[bw(ignore)]
+    pub nodes: Vec<CutsceneNode>,
+}
+
+#[binrw]
+#[derive(Debug)]
+pub struct CTRLNode {
+    /// In bytes, the size of the node information *including* this field.
+    size: u32, // number of following u32s
+    num_string_nodes: u32,
+    unk2: u32,
+    unk3: u32,
+    unk4: u32,
+    unk5: u32,
+    #[br(count = num_string_nodes)]
+    string_nodes: Vec<StringNode>,
+}
+
+#[binrw]
+#[derive(Debug)]
+pub struct CTISNode {
+    /// In bytes, the size of the node information *including* this field.
+    size: u32, // number of following u32s
+    unk1: u32,
+}
+
+#[binrw]
+#[derive(Debug)]
+pub struct CTDSNode {
+    /// In bytes, the size of the node information *including* this field.
+    size: u32, // number of following u32s
+    unk1: [u32; 15],
+    num_entries: u32,
+    unk2: u32,
+    /// From the beginning of this node.
+    offset_to_level: u32,
+    #[br(seek_before = SeekFrom::Current(offset_to_level as i64 - 76))] // 76 is the offset within this node, yes i know it's bad
+    #[br(restore_position, parse_with = read_string_until_null)]
+    #[bw(ignore)]
+    level_name: String,
+    unk3: [u32; 2], // seems to be empty
+    #[br(count = num_entries)]
+    entries: Vec<u64>,
+}
+
+#[binrw]
+#[br(import(string_heap: &StringHeap))]
+#[bw(import(string_heap: &mut StringHeap))]
+#[derive(Debug)]
+pub struct CTTLNode {
+    #[br(count = 4)]
+    #[bw(pad_size_to = 4)]
+    #[bw(map = write_string)]
+    #[br(map = read_string)]
+    name: String,
+    size: u32,
+    node_count: u32,
+    // TODO: unsure if this is really a count
+    #[br(count = node_count, args { inner: (string_heap,) })]
+    #[bw(ignore)]
+    node: Vec<TimelineNode>,
+}
+
+impl ReadableFile for Cutscene {
+    fn from_existing(platform: Platform, buffer: ByteSpan) -> Option<Cutscene> {
+        let mut cursor = Cursor::new(buffer);
+        let string_heap = StringHeap::from(0);
+        Cutscene::read_options(&mut cursor, platform.endianness(), (&string_heap,)).ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::pass_random_invalid;
+
+    use super::*;
+
+    #[test]
+    fn test_invalid() {
+        pass_random_invalid::<Cutscene>();
+    }
+}

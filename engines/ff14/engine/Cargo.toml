@@ -1,0 +1,16 @@
+[package]
+name = "ffl-ff14"
+description = "FFXIV engine for FFLocal: maps, models, characters and animation from the installed game."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ffl-core.workspace = true
+ffl-ff14-assets.workspace = true
+ffl-ff14-chara.workspace = true
+physis.workspace = true
+glam = "0.33"
+anyhow.workspace = true
+tracing.workspace = true

@@ -1,0 +1,30 @@
+[package]
+name = "ffl-app"
+description = "FFLocal application: launcher plus the Bevy runtime that renders any engine's scenes and characters."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "ffl-app"
+path = "src/main.rs"
+
+[features]
+default = []
+dev = ["bevy/dynamic_linking", "bevy/file_watcher"]
+
+[dependencies]
+ffl-core.workspace = true
+ffl-hub.workspace = true
+ffl-ff14.workspace = true
+ffl-ff11.workspace = true
+ffl-ff14-assets.workspace = true
+rfd = "0.16"
+tracing-subscriber.workspace = true
+bevy.workspace = true
+avian3d.workspace = true
+bevy_egui.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true

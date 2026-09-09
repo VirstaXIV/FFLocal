@@ -1,0 +1,19 @@
+[package]
+name = "ffl-ff14-assets"
+description = "Asset providers and typed loaders for FFLocal (Bevy-free)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ffl-core.workspace = true
+physis.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+toml.workspace = true
+dirs = "6"
+tracing.workspace = true
+lewton.workspace = true

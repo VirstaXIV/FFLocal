@@ -1,0 +1,227 @@
+// SPDX-FileCopyrightText: 2023 Joshua Goins <josh@redstrate.com>
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#![allow(unused)]
+#![allow(clippy::needless_late_init)]
+#![allow(clippy::upper_case_acronyms)]
+
+use binrw::helpers::until_eof;
+use binrw::{BinRead, binread};
+use std::io::{Cursor, SeekFrom};
+
+use crate::common::Platform;
+use crate::havok::{HavokAnimationContainer, HavokBinaryTagFileReader, HavokSkeleton, HavokSkeletonMapper};
+use crate::race::{Gender, Race, Tribe, get_race_id};
+use crate::{ByteSpan, ReadableFile};
+
+#[binread]
+struct SklbV1 {
+    unk_offset: u16,
+    havok_offset: u16,
+    body_id: u32,
+    mapper_body_id1: u32,
+    mapper_body_id2: u32,
+    mapper_body_id3: u32,
+}
+
+#[binread]
+struct SklbV2 {
+    unk_offset: u32,
+    havok_offset: u32,
+    unk: u32,
+    body_id: u32,
+    mapper_body_id1: u32,
+    mapper_body_id2: u32,
+    mapper_body_id3: u32,
+}
+
+#[binread]
+#[br(magic = 0x736B6C62i32)]
+struct SKLB {
+    version: u32,
+
+    #[br(if(version == 0x3132_3030u32))]
+    sklb_v1: Option<SklbV1>,
+
+    #[br(if(version == 0x3133_3030u32 || version == 0x3133_3031u32))]
+    sklb_v2: Option<SklbV2>,
+
+    #[br(seek_before(SeekFrom::Start(if (version == 0x3132_3030u32) { sklb_v1.as_ref().unwrap().havok_offset as u64 } else { sklb_v2.as_ref().unwrap().havok_offset as u64 })))]
+    #[br(parse_with = until_eof)]
+    raw_data: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Bone {
+    /// Name of the bone
+    pub name: String,
+    /// Index of the parent bone in the Skeleton's `bones` vector
+    pub parent_index: i32,
+
+    /// Position of the bone
+    pub position: [f32; 3],
+    /// Rotation quanternion of the bone
+    pub rotation: [f32; 4],
+    /// Scale of the bone
+    pub scale: [f32; 3],
+}
+
+/// A bone mapping between two skeletons (from `hkaSkeletonMapper`), with bones resolved to
+/// names so it can be applied to any skeleton carrying the same bone names.
+#[derive(Debug, Clone)]
+pub struct SkeletonMapping {
+    /// Bone of the source skeleton (A).
+    pub bone_a: String,
+    /// Bone of this skeleton (B).
+    pub bone_b: String,
+    /// `M_B[b] = M_A[a] * a_from_b` in model space (translation, quaternion xyzw, scale).
+    pub a_from_b_translation: [f32; 3],
+    pub a_from_b_rotation: [f32; 4],
+    pub a_from_b_scale: [f32; 3],
+}
+
+#[derive(Debug, Clone)]
+pub struct SkeletonChainMapping {
+    pub start_bone_a: String,
+    pub end_bone_a: String,
+    pub start_bone_b: String,
+    pub end_bone_b: String,
+}
+
+/// A retargeting mapper embedded in a skeleton file: how poses of the source skeleton
+/// `source_bones` (usually the Midlander-male base `c0101`) map onto this skeleton.
+#[derive(Debug, Clone)]
+pub struct SkeletonMapper {
+    pub source_name: String,
+    /// The source skeleton's bones (name, parent index, rest pose), needed to build its
+    /// model-space pose from a clip.
+    pub source_bones: Vec<Bone>,
+    pub target_name: String,
+    pub simple_mappings: Vec<SkeletonMapping>,
+    pub chain_mappings: Vec<SkeletonChainMapping>,
+    pub unmapped_bones: Vec<String>,
+    pub keep_unmapped_local: bool,
+    /// 0 = ragdoll, 1 = retargeting.
+    pub mapping_type: i32,
+    /// This skeleton's bones as the mapper stores them (the mapper's skeleton B).
+    pub target_bones: Vec<Bone>,
+}
+
+/// Skeleton file, usually with the `.sklb` file extension.
+///
+/// Contains a tree of bones.
+#[derive(Debug)]
+pub struct Skeleton {
+    /// Bones of this skeleton
+    pub bones: Vec<Bone>,
+    /// Retargeting mappers embedded in the file (empty for the base skeleton).
+    pub mappers: Vec<SkeletonMapper>,
+}
+
+impl ReadableFile for Skeleton {
+    fn from_existing(platform: Platform, buffer: ByteSpan) -> Option<Skeleton> {
+        let mut cursor = Cursor::new(buffer);
+
+        let sklb = SKLB::read_options(&mut cursor, platform.endianness(), ()).ok()?;
+
+        let root = HavokBinaryTagFileReader::read(&sklb.raw_data);
+        let raw_animation_container = root.find_object_by_type("hkaAnimationContainer");
+        let animation_container = HavokAnimationContainer::new(raw_animation_container);
+
+        let havok_skeleton = &animation_container.skeletons[0];
+
+        let mut skeleton = Skeleton {
+            bones: vec![],
+            mappers: vec![],
+        };
+
+        for (index, bone) in havok_skeleton.bone_names.iter().enumerate() {
+            skeleton.bones.push(Bone {
+                name: bone.clone(),
+                parent_index: havok_skeleton.parent_indices[index] as i32,
+                position: [
+                    havok_skeleton.reference_pose[index].translation[0],
+                    havok_skeleton.reference_pose[index].translation[1],
+                    havok_skeleton.reference_pose[index].translation[2],
+                ],
+                rotation: havok_skeleton.reference_pose[index].rotation,
+                scale: [
+                    havok_skeleton.reference_pose[index].scale[0],
+                    havok_skeleton.reference_pose[index].scale[1],
+                    havok_skeleton.reference_pose[index].scale[2],
+                ],
+            });
+        }
+
+        for mapper in root.find_objects_by_type("hkaSkeletonMapper") {
+            let m = HavokSkeletonMapper::new(mapper);
+            let bones_of = |hs: &HavokSkeleton| -> Vec<Bone> {
+                hs.bone_names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| Bone {
+                        name: name.clone(),
+                        parent_index: hs.parent_indices[i] as i32,
+                        position: [hs.reference_pose[i].translation[0], hs.reference_pose[i].translation[1], hs.reference_pose[i].translation[2]],
+                        rotation: hs.reference_pose[i].rotation,
+                        scale: [hs.reference_pose[i].scale[0], hs.reference_pose[i].scale[1], hs.reference_pose[i].scale[2]],
+                    })
+                    .collect()
+            };
+            let name_a = |i: usize| m.skeleton_a.bone_names.get(i).cloned().unwrap_or_default();
+            let name_b = |i: usize| m.skeleton_b.bone_names.get(i).cloned().unwrap_or_default();
+            skeleton.mappers.push(SkeletonMapper {
+                source_name: m.skeleton_a.name.clone(),
+                source_bones: bones_of(&m.skeleton_a),
+                target_name: m.skeleton_b.name.clone(),
+                simple_mappings: m
+                    .simple_mappings
+                    .iter()
+                    .map(|sm| SkeletonMapping {
+                        bone_a: name_a(sm.bone_a),
+                        bone_b: name_b(sm.bone_b),
+                        a_from_b_translation: [sm.a_from_b.translation[0], sm.a_from_b.translation[1], sm.a_from_b.translation[2]],
+                        a_from_b_rotation: sm.a_from_b.rotation,
+                        a_from_b_scale: [sm.a_from_b.scale[0], sm.a_from_b.scale[1], sm.a_from_b.scale[2]],
+                    })
+                    .collect(),
+                chain_mappings: m
+                    .chain_mappings
+                    .iter()
+                    .map(|c| SkeletonChainMapping {
+                        start_bone_a: name_a(c.start_bone_a),
+                        end_bone_a: name_a(c.end_bone_a),
+                        start_bone_b: name_b(c.start_bone_b),
+                        end_bone_b: name_b(c.end_bone_b),
+                    })
+                    .collect(),
+                unmapped_bones: m.unmapped_bones.iter().map(|&i| name_b(i)).collect(),
+                keep_unmapped_local: m.keep_unmapped_local,
+                mapping_type: m.mapping_type,
+                target_bones: bones_of(&m.skeleton_b),
+            });
+        }
+
+        Some(skeleton)
+    }
+}
+
+impl Skeleton {
+    /// Builds a game path to the specified skeleton.
+    pub fn path(race: Race, tribe: Tribe, gender: Gender) -> String {
+        let race_id = get_race_id(race, tribe, gender).unwrap();
+        format!("chara/human/c{race_id:04}/skeleton/base/b0001/skl_c{race_id:04}b0001.sklb")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::pass_random_invalid;
+
+    use super::*;
+
+    #[test]
+    fn test_invalid() {
+        pass_random_invalid::<Skeleton>();
+    }
+}

@@ -1,0 +1,1127 @@
+diff --color -ruN -x target -x '*.orig' -x Cargo.lock physis-pristine/src/havok/animation_binding.rs physis-now/src/havok/animation_binding.rs
+--- a/src/havok/animation_binding.rs	2026-09-09 10:08:04.495558318 -0600
++++ b/src/havok/animation_binding.rs	2026-09-09 15:21:31.815586046 -0600
+@@ -17,10 +17,11 @@
+ 
+ impl HavokAnimationBlendHint {
+     pub fn from_raw(raw: u8) -> Self {
++        // FFLocal: 2 (ADDITIVE_DEPRECATED) and anything unknown counts as additive rather
++        // than aborting.
+         match raw {
+             0 => Self::Normal,
+-            1 => Self::Additive,
+-            _ => panic!(),
++            _ => Self::Additive,
+         }
+     }
+ }
+diff --color -ruN -x target -x '*.orig' -x Cargo.lock physis-pristine/src/havok/binary_tag_file_reader.rs physis-now/src/havok/binary_tag_file_reader.rs
+--- a/src/havok/binary_tag_file_reader.rs	2026-09-09 10:08:04.495566399 -0600
++++ b/src/havok/binary_tag_file_reader.rs	2026-09-09 15:21:31.815604216 -0600
+@@ -92,7 +92,15 @@
+             match tag_type {
+                 HavokTagType::FileInfo => {
+                     self.file_version = self.read_packed_int() as u8;
+-                    assert_eq!(self.file_version, 3, "Unimplemented version");
++                    // FFLocal: version 4/5 files (hk_2014.2.5, every skeleton and animation
++                    // mod tools write) add the SDK version string and three 16-bit values
++                    // (21, 1, 20 in every file seen) to the file info; the rest of the
++                    // stream is identical to version 3.
++                    assert!(self.file_version >= 3 && self.file_version <= 5, "Unimplemented tag file version {}", self.file_version);
++                    if self.file_version >= 4 {
++                        let _sdk_version = self.read_string();
++                        let _ = self.reader.read_bytes(6);
++                    }
+                     self.remembered_objects
+                         .push(Arc::new(RefCell::new(HavokObject::new(
+                             self.remembered_types[0].clone(),
+diff --color -ruN -x target -x '*.orig' -x Cargo.lock physis-pristine/src/havok/mod.rs physis-now/src/havok/mod.rs
+--- a/src/havok/mod.rs	2026-09-09 10:08:04.505012542 -0600
++++ b/src/havok/mod.rs	2026-09-09 15:21:31.815654717 -0600
+@@ -12,10 +12,17 @@
+ mod byte_reader;
+ mod object;
+ mod skeleton;
++mod skeleton_mapper;
+ mod slice_ext;
+ mod spline_compressed_animation;
+ mod transform;
+ 
+ pub use animation::HavokAnimation;
++pub use animation_binding::{HavokAnimationBinding, HavokAnimationBlendHint};
+ pub use animation_container::HavokAnimationContainer;
+ pub use binary_tag_file_reader::HavokBinaryTagFileReader;
++pub use object::{HavokObject, HavokRootObject, HavokValue};
++pub use skeleton::HavokSkeleton;
++pub use skeleton_mapper::{HavokChainMapping, HavokSimpleMapping, HavokSkeletonMapper};
++pub use spline_compressed_animation::HavokSplineCompressedAnimation;
++pub use transform::HavokTransform;
+diff --color -ruN -x target -x '*.orig' -x Cargo.lock physis-pristine/src/havok/object.rs physis-now/src/havok/object.rs
+--- a/src/havok/object.rs	2026-09-09 10:08:04.505053272 -0600
++++ b/src/havok/object.rs	2026-09-09 15:21:31.815624646 -0600
+@@ -154,6 +154,21 @@
+         Self { object }
+     }
+ 
++    /// Every named variant of `type_name` in the root container (a skeleton file can hold
++    /// several `hkaSkeletonMapper`s).
++    pub fn find_objects_by_type(&self, type_name: &str) -> Vec<Arc<RefCell<HavokObject>>> {
++        let root_obj = self.object.borrow();
++        let named_variants = root_obj.get("namedVariants");
++        let mut out = Vec::new();
++        for variant in named_variants.as_array() {
++            let variant_obj = variant.as_object();
++            if variant_obj.borrow().get("className").as_string() == type_name {
++                out.push(variant_obj.borrow().get("variant").as_object());
++            }
++        }
++        out
++    }
++
+     pub fn find_object_by_type(&self, type_name: &'static str) -> Arc<RefCell<HavokObject>> {
+         let root_obj = self.object.borrow();
+         let named_variants = root_obj.get("namedVariants");
+@@ -248,14 +263,22 @@
+     }
+ 
+     pub fn get(&self, member_name: &str) -> &HavokValue {
++        self.try_get(member_name).unwrap()
++    }
++
++    /// `get` without panicking on a member the type does not have.
++    pub fn try_get(&self, member_name: &str) -> Option<&HavokValue> {
+         let member_index = self
+             .object_type
+             .members()
+             .iter()
+-            .position(|&x| &*x.name == member_name)
+-            .unwrap();
++            .position(|&x| &*x.name == member_name)?;
++
++        self.data.get(&member_index)
++    }
+ 
+-        self.data.get(&member_index).unwrap()
++    pub fn type_name(&self) -> &str {
++        &self.object_type.name
+     }
+ 
+     pub(crate) fn members_mut(&mut self) -> impl Iterator<Item = (&usize, &mut HavokValue)> {
+diff --color -ruN -x target -x '*.orig' -x Cargo.lock physis-pristine/src/havok/skeleton_mapper.rs physis-now/src/havok/skeleton_mapper.rs
+--- a/src/havok/skeleton_mapper.rs	1969-12-31 17:00:00.000000000 -0700
++++ b/src/havok/skeleton_mapper.rs	2026-09-09 15:21:31.815677397 -0600
+@@ -0,0 +1,108 @@
++// SPDX-FileCopyrightText: 2026 FFLocal contributors
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++//! `hkaSkeletonMapper`: how a pose of skeleton A (the base skeleton an animation was authored
++//! for) maps onto skeleton B (the skeleton the file belongs to). Race skeletons other than the
++//! Midlander-male base carry one so the game can play base-skeleton clips on them.
++
++use crate::havok::object::HavokObject;
++use crate::havok::skeleton::HavokSkeleton;
++use crate::havok::transform::HavokTransform;
++use core::cell::RefCell;
++use std::sync::Arc;
++
++#[derive(Debug)]
++pub struct HavokSimpleMapping {
++    pub bone_a: usize,
++    pub bone_b: usize,
++    /// Transform from B's bone into A's bone space (`M_B[b] = M_A[a] * a_from_b`).
++    pub a_from_b: HavokTransform,
++}
++
++#[derive(Debug)]
++pub struct HavokChainMapping {
++    pub start_bone_a: usize,
++    pub end_bone_a: usize,
++    pub start_bone_b: usize,
++    pub end_bone_b: usize,
++    pub start_a_from_b: HavokTransform,
++    pub end_a_from_b: HavokTransform,
++}
++
++#[derive(Debug)]
++pub struct HavokSkeletonMapper {
++    pub skeleton_a: HavokSkeleton,
++    pub skeleton_b: HavokSkeleton,
++    pub simple_mappings: Vec<HavokSimpleMapping>,
++    pub chain_mappings: Vec<HavokChainMapping>,
++    /// Bones of B with no mapping (keep their local pose).
++    pub unmapped_bones: Vec<usize>,
++    pub keep_unmapped_local: bool,
++    /// 0 = ragdoll, 1 = retargeting.
++    pub mapping_type: i32,
++}
++
++impl HavokSkeletonMapper {
++    pub fn new(object: Arc<RefCell<HavokObject>>) -> Self {
++        let root = object.borrow();
++        let mapping = root.get("mapping").as_object();
++        let mapping = mapping.borrow();
++        let skeleton_a = HavokSkeleton::new(mapping.get("skeletonA").as_object());
++        let skeleton_b = HavokSkeleton::new(mapping.get("skeletonB").as_object());
++        // Tagfiles omit members at their default value, so a bone index of 0 is simply absent.
++        let int = |o: &HavokObject, name: &str| o.try_get(name).map(|v| v.as_int() as usize).unwrap_or(0);
++        let transform = |o: &HavokObject, name: &str| match o.try_get(name) {
++            Some(v) => HavokTransform::new(v.as_vec()),
++            None => HavokTransform::from_trs([0.0; 4], [0.0, 0.0, 0.0, 1.0], [1.0; 4]),
++        };
++        let empty = Vec::new();
++        let simple_mappings = mapping
++            .try_get("simpleMappings")
++            .map(|v| v.as_array())
++            .unwrap_or(&empty)
++            .iter()
++            .map(|x| {
++                let m = x.as_object();
++                let m = m.borrow();
++                HavokSimpleMapping {
++                    bone_a: int(&m, "boneA"),
++                    bone_b: int(&m, "boneB"),
++                    a_from_b: transform(&m, "aFromBTransform"),
++                }
++            })
++            .collect();
++        let chain_mappings = mapping
++            .try_get("chainMappings")
++            .map(|v| v.as_array())
++            .unwrap_or(&empty)
++            .iter()
++            .map(|x| {
++                let m = x.as_object();
++                let m = m.borrow();
++                HavokChainMapping {
++                    start_bone_a: int(&m, "startBoneA"),
++                    end_bone_a: int(&m, "endBoneA"),
++                    start_bone_b: int(&m, "startBoneB"),
++                    end_bone_b: int(&m, "endBoneB"),
++                    start_a_from_b: transform(&m, "startAFromBTransform"),
++                    end_a_from_b: transform(&m, "endAFromBTransform"),
++                }
++            })
++            .collect();
++        let unmapped_bones = mapping
++            .try_get("unmappedBones")
++            .map(|v| v.as_array().iter().map(|x| x.as_int() as usize).collect())
++            .unwrap_or_default();
++        let keep_unmapped_local = mapping.try_get("keepUnmappedLocal").map(|v| v.as_int() != 0).unwrap_or(true);
++        let mapping_type = mapping.try_get("mappingType").map(|v| v.as_int() as i32).unwrap_or(1);
++        Self {
++            skeleton_a,
++            skeleton_b,
++            simple_mappings,
++            chain_mappings,
++            unmapped_bones,
++            keep_unmapped_local,
++            mapping_type,
++        }
++    }
++}
+diff --color -ruN -x target -x '*.orig' -x Cargo.lock physis-pristine/src/havok/skeleton.rs physis-now/src/havok/skeleton.rs
+--- a/src/havok/skeleton.rs	2026-09-09 10:08:04.505108163 -0600
++++ b/src/havok/skeleton.rs	2026-09-09 15:21:31.815633656 -0600
+@@ -8,6 +8,8 @@
+ 
+ #[derive(Debug)]
+ pub struct HavokSkeleton {
++    /// Skeleton name (e.g. `c0101`), when present.
++    pub name: String,
+     pub bone_names: Vec<String>,
+     pub parent_indices: Vec<usize>,
+     pub reference_pose: Vec<HavokTransform>,
+@@ -39,7 +41,10 @@
+             .map(|x| HavokTransform::new(x.as_vec()))
+             .collect::<Vec<_>>();
+ 
++        let name = root.try_get("name").map(|v| v.as_string().to_owned()).unwrap_or_default();
++
+         Self {
++            name,
+             bone_names,
+             parent_indices,
+             reference_pose,
+diff --color -ruN -x target -x '*.orig' -x Cargo.lock physis-pristine/src/havok/spline_compressed_animation.rs physis-now/src/havok/spline_compressed_animation.rs
+--- a/src/havok/spline_compressed_animation.rs	2026-09-09 10:08:04.505141683 -0600
++++ b/src/havok/spline_compressed_animation.rs	2026-09-09 15:21:31.815664787 -0600
+@@ -11,6 +11,7 @@
+ 
+ #[repr(u8)]
+ #[allow(clippy::upper_case_acronyms)]
++#[derive(Debug, Clone, Copy)]
+ enum RotationQuantization {
+     POLAR32 = 0,
+     THREECOMP40 = 1,
+@@ -184,8 +185,9 @@
+         #[allow(non_snake_case)]
+         let mut U = vec![0.; 2 * p];
+ 
++        // The 2p knots surrounding the span: knots[span - p + 1 ..= span + p].
+         for i in 0..2 * p {
+-            let item = raw[i + 1] as usize + span - p;
++            let item = raw[i + 1 + span - p] as usize;
+             U[i] = (item as f32) * frame_duration;
+         }
+ 
+@@ -202,7 +204,8 @@
+ 
+         let value = 1. - high * high;
+ 
+-        let a = f32::sqrt(low);
++        // The 18-bit value packs two polar indices: low = a*a + b with a = floor(sqrt(low)).
++        let a = f32::sqrt(low).floor();
+         let b = low - a * a;
+         let c = if a == 0. { f32::MAX } else { 1. / (a + a) };
+ 
+@@ -276,7 +279,7 @@
+         }
+ 
+         let length_square = result.iter().map(|x| x * x).sum::<f32>();
+-        let mut remaining = f32::sqrt(1. - length_square);
++        let mut remaining = f32::sqrt((1. - length_square).max(0.));
+         if (data[1] & 64) == 64 {
+             remaining = -remaining;
+         }
+@@ -639,8 +642,10 @@
+         self.duration
+     }
+ 
++    /// `time` is in seconds (the same unit as [`HavokAnimation::duration`]).
+     fn sample(&self, time: f32) -> Vec<HavokTransform> {
+-        let frame_float = ((time / 1000.) / self.duration) * (self.num_frames as f32 - 1.);
++        let t = if self.duration > 0. { time.clamp(0., self.duration) } else { 0. };
++        let frame_float = (t / self.duration) * (self.num_frames as f32 - 1.);
+         let frame = frame_float as usize;
+         let delta = frame_float - frame as f32;
+ 
+diff --color -ruN -x target -x '*.orig' -x Cargo.lock physis-pristine/src/layer/range.rs physis-now/src/layer/range.rs
+--- a/src/layer/range.rs	2026-09-09 10:08:04.505407007 -0600
++++ b/src/layer/range.rs	2026-09-09 15:21:31.815804009 -0600
+@@ -36,13 +36,14 @@
+ #[derive(Debug, PartialEq)]
+ pub struct MapRangeInstanceObject {
+     pub parent_data: TriggerBoxInstanceObject,
+-    map: u32,
++    pub map: u32,
+     /// Name for the general location. Index into the PlaceName Sxcel sheet.
+     pub place_name_block: u32,
+     /// Name for the specific spot. Index into the PlaceName Sxcel sheet.
+     pub place_name_spot: u32,
+-    weather: u32,
+-    bgm: u32,
++    pub weather: u32,
++    /// Sub-area music: a `TerritoryType.BGM`-style value (BGM / BGMSituation / BGMSwitch row).
++    pub bgm: u32,
+     padding: [u8; 10],
+     housing_block_id: u8,
+     /// Most likely affects whether the EXP bonus affects this area.
+@@ -64,17 +65,17 @@
+     pub discovery_enabled: bool,
+     #[br(map = read_bool_from::<u8>)]
+     #[bw(map = write_bool_as::<u8>)]
+-    bgm_enabled: bool,
++    pub bgm_enabled: bool,
+     #[br(map = read_bool_from::<u8>)]
+     #[bw(map = write_bool_as::<u8>)]
+-    weather_enabled: bool,
++    pub weather_enabled: bool,
+     /// Whether this area is marked as a sanctuary.
+     #[br(map = read_bool_from::<u8>)]
+     #[bw(map = write_bool_as::<u8>)]
+     pub rest_bonus_enabled: bool,
+     #[br(map = read_bool_from::<u8>)]
+     #[bw(map = write_bool_as::<u8>)]
+-    bgm_play_zone_in_only: bool,
++    pub bgm_play_zone_in_only: bool,
+     #[br(map = read_bool_from::<u8>)]
+     #[bw(map = write_bool_as::<u8>)]
+     lift_enabled: bool,
+diff --color -ruN -x target -x '*.orig' -x Cargo.lock physis-pristine/src/lib.rs physis-now/src/lib.rs
+--- a/src/lib.rs	2026-09-09 10:08:04.505178034 -0600
++++ b/src/lib.rs	2026-09-09 15:21:31.816300257 -0600
+@@ -32,7 +32,7 @@
+ pub mod equipment;
+ 
+ // NOTE: Should be brought up to top-level because these are the most used types.
+-mod common;
++pub mod common;
+ #[cfg(test)]
+ pub(crate) use common::pass_random_invalid;
+ pub use common::{
+@@ -79,8 +79,8 @@
+ /// Types for and writing the plaintext config (`.cfg`) files.
+ pub mod cfg;
+ 
+-/// Havok file parsing currently used for reading skeletons.
+-mod havok;
++/// Havok file parsing used for reading skeletons and animations.
++pub mod havok;
+ 
+ /// Types for pre-bone deform (`.pbd`) files.
+ pub mod pbd;
+diff --color -ruN -x target -x '*.orig' -x Cargo.lock physis-pristine/src/model/file_operations.rs physis-now/src/model/file_operations.rs
+--- a/src/model/file_operations.rs	2026-09-09 10:08:04.495726701 -0600
++++ b/src/model/file_operations.rs	2026-09-09 15:21:31.815918831 -0600
+@@ -129,6 +129,14 @@
+         cursor.read_type_args::<[f32; 3]>(endian, ())
+     }
+ 
++    /// FFLocal: two floats (a `Single2` uv element as written by TexTools).
++    pub(crate) fn read_single2(
++        cursor: &mut Cursor<ByteSpan>,
++        endian: Endian,
++    ) -> BinResult<[f32; 2]> {
++        cursor.read_type_args::<[f32; 2]>(endian, ())
++    }
++
+     pub(crate) fn write_single3<T: BinWriterExt>(
+         cursor: &mut T,
+         endian: Endian,
+@@ -152,6 +160,7 @@
+         cursor.write_type_args::<[f32; 4]>(vec, endian, ())
+     }
+ 
++    #[allow(dead_code)]
+     pub(crate) fn read_unsigned_short4(
+         cursor: &mut Cursor<ByteSpan>,
+         endian: Endian,
+diff --color -ruN -x target -x '*.orig' -x Cargo.lock physis-pristine/src/model/mod.rs physis-now/src/model/mod.rs
+--- a/src/model/mod.rs	2026-09-09 10:08:04.505226785 -0600
++++ b/src/model/mod.rs	2026-09-09 15:21:31.815901581 -0600
+@@ -434,7 +434,12 @@
+     #[br(count = submesh_bone_map_size / 2)]
+     submesh_bone_map: Vec<u16>,
+ 
+-    #[br(count = header.patch_72_table_size * 16)]
++    /// Neck morph table (face models since patch 7.1), see xivModdingFramework `Mdl.cs`.
++    #[br(count = header.neck_morph_table_size)]
++    neck_morphs: Vec<NeckMorph>,
++
++    /// Unknown per-vertex shadow data on face models since patch 7.2 (16 bytes per entry).
++    #[br(count = header.patch_72_table_size as u32 * 16)]
+     unknown_72_padding: Vec<u8>,
+ 
+     padding_amount: u8,
+@@ -450,6 +455,18 @@
+     bone_bounding_boxes: Vec<BoundingBox>,
+ }
+ 
++/// Neck seam morph entry on face models (patch 7.1+).
++#[binrw]
++#[derive(Debug, Clone, PartialEq)]
++#[allow(dead_code)]
++struct NeckMorph {
++    position_adjust: [f32; 3],
++    unknown: u32,
++    normal_adjust: [f32; 3],
++    /// Indices into bone table 0; slots 3 and 4 use 0 as a terminator.
++    bone_indices: [u8; 4],
++}
++
+ #[binrw]
+ #[derive(Debug, Clone, PartialEq)]
+ #[allow(dead_code)]
+@@ -473,6 +490,9 @@
+ 
+     pub bone_weight: [f32; 4],
+     pub bone_id: [u8; 4],
++    /// FFLocal: influences 5..8 of Dawntrail's eight-weight vertices (zero otherwise).
++    pub bone_weight2: [f32; 4],
++    pub bone_id2: [u8; 4],
+ }
+ 
+ impl Default for Vertex {
+@@ -486,6 +506,8 @@
+             color: [0.0; 4],
+             bone_weight: [0.0; 4],
+             bone_id: [0u8; 4],
++            bone_weight2: [0.0; 4],
++            bone_id2: [0u8; 4],
+         }
+     }
+ }
+@@ -503,6 +525,8 @@
+     submesh_index: usize,
+     pub index_count: u32,
+     pub index_offset: u32,
++    /// Bitmask over [MDL::attribute_names]; the game hides submeshes whose attributes are masked out (e.g. by IMC).
++    pub attribute_index_mask: u32,
+ }
+ 
+ #[derive(Debug, Clone)]
+@@ -515,6 +539,9 @@
+ #[derive(Debug, Clone)]
+ pub struct Part {
+     mesh_index: u16,
++    /// The bone table of this mesh: `bone_table[vertex.bone_id[k]]` indexes [MDL::affected_bone_names].
++    /// Empty for meshes without skinning (e.g. background models).
++    pub bone_table: Vec<u16>,
+     pub vertices: Vec<Vertex>,
+     /// Indexed by VertexElement::stream
+     pub vertex_streams: Vec<Vec<u8>>,
+@@ -549,9 +576,32 @@
+     pub lods: Vec<Lod>,
+     pub affected_bone_names: Vec<String>,
+     pub material_names: Vec<String>,
++    /// Attribute names (e.g. `atr_nek`), indexed by the bits of [SubMesh::attribute_index_mask].
++    pub attribute_names: Vec<String>,
+ }
+ 
+ impl MDL {
++    /// Per LOD: the distance ranges from the file (`model_lod_range`, `texture_lod_range`).
++    pub fn lod_ranges(&self) -> Vec<(f32, f32)> {
++        self.model_data.lods.iter().map(|l| (l.model_lod_range, l.texture_lod_range)).collect()
++    }
++
++    /// Bounding radius from the file header (0 when unset).
++    pub fn file_radius(&self) -> f32 {
++        self.model_data.header.radius
++    }
++
++    /// FFLocal: the vertex declaration of a mesh as (stream, offset, type, usage) for
++    /// inspection.
++    pub fn vertex_elements(&self, mesh_index: usize) -> Vec<(u8, u8, String, String)> {
++        self.model_data
++            .header
++            .vertex_declarations
++            .get(mesh_index)
++            .map(|d| d.elements.iter().map(|e| (e.stream, e.offset, format!("{:?}", e.vertex_type), format!("{:?}", e.vertex_usage))).collect())
++            .unwrap_or_default()
++    }
++
+     pub fn replace_vertices(
+         &mut self,
+         lod_index: usize,
+@@ -833,6 +883,13 @@
+             material_names.push(name);
+         }
+ 
++        let mut attribute_names = vec![];
++
++        for offset in &model.attribute_name_offsets {
++            let (name, _) = null_terminated_utf8(&model.header.strings, *offset as usize);
++            attribute_names.push(name);
++        }
++
+         let mut lods = vec![];
+ 
+         for i in 0..model.header.lod_count {
+@@ -852,6 +909,10 @@
+                 let mut vertices: Vec<Vertex> = vec![Vertex::default(); vertex_count as usize];
+ 
+                 for k in 0..vertex_count {
++                    // FFLocal: uv sets are assigned in element order (TexTools exports carry a
++                    // Single4 pair followed by a Single2 third set; writing that one into uv0
++                    // made every modded mesh sample a single texel).
++                    let mut uv_filled: usize = 0;
+                     for element in &declaration.elements {
+                         cursor
+                             .seek(SeekFrom::Start(
+@@ -883,10 +944,9 @@
+                                         MDL::read_single3(&mut cursor, endianness).unwrap();
+                                 }
+                                 _ => {
+-                                    panic!(
+-                                        "Unexpected vertex type for position: {:#?}",
+-                                        element.vertex_type
+-                                    );
++                                    // FFLocal: vertex types this reader does not decode (mod tools
++                                    // write formats retail never uses) leave the position at its default
++                                    // instead of aborting the whole model.
+                                 }
+                             },
+                             VertexUsage::BlendWeights => match element.vertex_type {
+@@ -899,20 +959,27 @@
+                                         MDL::read_byte_float4(&mut cursor).unwrap();
+                                 }
+                                 VertexType::UnsignedShort4 => {
+-                                    let bytes =
+-                                        MDL::read_unsigned_short4(&mut cursor, endianness).unwrap();
++                                    // FFLocal: type 17 on blend weights is Dawntrail's eight
++                                    // unsigned bytes (eight influences), not four shorts.
++                                    let a = MDL::read_byte4(&mut cursor).unwrap();
++                                    let b = MDL::read_byte4(&mut cursor).unwrap();
+                                     vertices[k as usize].bone_weight = [
+-                                        f32::from(bytes[0]),
+-                                        f32::from(bytes[1]),
+-                                        f32::from(bytes[2]),
+-                                        f32::from(bytes[3]),
++                                        f32::from(a[0]) / 255.0,
++                                        f32::from(a[1]) / 255.0,
++                                        f32::from(a[2]) / 255.0,
++                                        f32::from(a[3]) / 255.0,
++                                    ];
++                                    vertices[k as usize].bone_weight2 = [
++                                        f32::from(b[0]) / 255.0,
++                                        f32::from(b[1]) / 255.0,
++                                        f32::from(b[2]) / 255.0,
++                                        f32::from(b[3]) / 255.0,
+                                     ];
+                                 }
+                                 _ => {
+-                                    panic!(
+-                                        "Unexpected vertex type for blendweight: {:#?}",
+-                                        element.vertex_type
+-                                    );
++                                    // FFLocal: vertex types this reader does not decode (mod tools
++                                    // write formats retail never uses) leave the blendweight at its default
++                                    // instead of aborting the whole model.
+                                 }
+                             },
+                             VertexUsage::BlendIndices => match element.vertex_type {
+@@ -921,20 +988,14 @@
+                                         MDL::read_byte4(&mut cursor).unwrap();
+                                 }
+                                 VertexType::UnsignedShort4 => {
+-                                    let shorts =
+-                                        MDL::read_unsigned_short4(&mut cursor, endianness).unwrap();
+-                                    vertices[k as usize].bone_id = [
+-                                        shorts[0] as u8,
+-                                        shorts[1] as u8,
+-                                        shorts[2] as u8,
+-                                        shorts[3] as u8,
+-                                    ];
++                                    // FFLocal: eight bone indices, one byte each.
++                                    vertices[k as usize].bone_id = MDL::read_byte4(&mut cursor).unwrap();
++                                    vertices[k as usize].bone_id2 = MDL::read_byte4(&mut cursor).unwrap();
+                                 }
+                                 _ => {
+-                                    panic!(
+-                                        "Unexpected vertex type for blendindice: {:#?}",
+-                                        element.vertex_type
+-                                    );
++                                    // FFLocal: vertex types this reader does not decode (mod tools
++                                    // write formats retail never uses) leave the blendindice at its default
++                                    // instead of aborting the whole model.
+                                 }
+                             },
+                             VertexUsage::Normal => match element.vertex_type {
+@@ -954,44 +1015,45 @@
+                                     );
+                                 }
+                                 _ => {
+-                                    panic!(
+-                                        "Unexpected vertex type for normal: {:#?}",
+-                                        element.vertex_type
+-                                    );
++                                    // FFLocal: vertex types this reader does not decode (mod tools
++                                    // write formats retail never uses) leave the normal at its default
++                                    // instead of aborting the whole model.
+                                 }
+                             },
+                             VertexUsage::UV => match element.vertex_type {
+-                                VertexType::ByteFloat4 => {
+-                                    let combined = MDL::read_byte_float4(&mut cursor).unwrap();
+-
+-                                    vertices[k as usize].uv0.clone_from_slice(&combined[0..2]);
+-                                    vertices[k as usize].uv1.clone_from_slice(&combined[2..4]);
+-                                }
+-                                VertexType::Half4 => {
+-                                    let combined =
+-                                        MDL::read_half4(&mut cursor, endianness).unwrap();
+-
+-                                    vertices[k as usize].uv0.clone_from_slice(&combined[0..2]);
+-                                    vertices[k as usize].uv1.clone_from_slice(&combined[2..4]);
+-                                }
+-                                VertexType::Single4 => {
+-                                    let combined =
+-                                        MDL::read_single4(&mut cursor, endianness).unwrap();
+-
+-                                    vertices[k as usize].uv0.clone_from_slice(&combined[0..2]);
+-                                    vertices[k as usize].uv1.clone_from_slice(&combined[2..4]);
++                                VertexType::ByteFloat4 | VertexType::Half4 | VertexType::Single4 => {
++                                    let combined = match element.vertex_type {
++                                        VertexType::ByteFloat4 => MDL::read_byte_float4(&mut cursor).unwrap(),
++                                        VertexType::Half4 => MDL::read_half4(&mut cursor, endianness).unwrap(),
++                                        _ => MDL::read_single4(&mut cursor, endianness).unwrap(),
++                                    };
++                                    match uv_filled / 2 {
++                                        0 => {
++                                            vertices[k as usize].uv0.clone_from_slice(&combined[0..2]);
++                                            vertices[k as usize].uv1.clone_from_slice(&combined[2..4]);
++                                        }
++                                        1 => vertices[k as usize].uv1.clone_from_slice(&combined[0..2]),
++                                        _ => {}
++                                    }
++                                    uv_filled += 4;
+                                 }
+-                                VertexType::Half2 => {
+-                                    let combined =
+-                                        MDL::read_half2(&mut cursor, endianness).unwrap();
+-
+-                                    vertices[k as usize].uv0.clone_from_slice(&combined[0..2]);
++                                VertexType::Half2 | VertexType::Single2 => {
++                                    // Two floats: one uv set (TexTools exports).
++                                    let combined = match element.vertex_type {
++                                        VertexType::Half2 => MDL::read_half2(&mut cursor, endianness).unwrap(),
++                                        _ => MDL::read_single2(&mut cursor, endianness).unwrap(),
++                                    };
++                                    match uv_filled / 2 {
++                                        0 => vertices[k as usize].uv0.clone_from_slice(&combined[0..2]),
++                                        1 => vertices[k as usize].uv1.clone_from_slice(&combined[0..2]),
++                                        _ => {}
++                                    }
++                                    uv_filled += 2;
+                                 }
+                                 _ => {
+-                                    panic!(
+-                                        "Unexpected vertex type for uv: {:#?}",
+-                                        element.vertex_type
+-                                    );
++                                    // FFLocal: vertex types this reader does not decode (mod tools
++                                    // write formats retail never uses) leave the uv at its default
++                                    // instead of aborting the whole model.
+                                 }
+                             },
+                             VertexUsage::BiTangent => match element.vertex_type {
+@@ -1000,10 +1062,9 @@
+                                         MDL::read_tangent(&mut cursor).unwrap();
+                                 }
+                                 _ => {
+-                                    panic!(
+-                                        "Unexpected vertex type for bitangent: {:#?}",
+-                                        element.vertex_type
+-                                    );
++                                    // FFLocal: vertex types this reader does not decode (mod tools
++                                    // write formats retail never uses) leave the bitangent at its default
++                                    // instead of aborting the whole model.
+                                 }
+                             },
+                             VertexUsage::Tangent => {
+@@ -1011,11 +1072,10 @@
+                                     // Used for... terrain..?
+                                     VertexType::ByteFloat4 => {}
+                                     _ => {
+-                                        panic!(
+-                                            "Unexpected vertex type for tangent: {:#?}",
+-                                            element.vertex_type
+-                                        );
+-                                    }
++                                    // FFLocal: vertex types this reader does not decode (mod tools
++                                    // write formats retail never uses) leave the tangent at its default
++                                    // instead of aborting the whole model.
++                                }
+                                 }
+                             }
+                             VertexUsage::Color => match element.vertex_type {
+@@ -1024,10 +1084,9 @@
+                                         MDL::read_byte_float4(&mut cursor).unwrap();
+                                 }
+                                 _ => {
+-                                    panic!(
+-                                        "Unexpected vertex type for color: {:#?}",
+-                                        element.vertex_type
+-                                    );
++                                    // FFLocal: vertex types this reader does not decode (mod tools
++                                    // write formats retail never uses) leave the color at its default
++                                    // instead of aborting the whole model.
+                                 }
+                             },
+                         }
+@@ -1058,6 +1117,9 @@
+                         index_offset: model.submeshes
+                             [model.meshes[j as usize].submesh_index as usize + i as usize]
+                             .index_offset,
++                        attribute_index_mask: model.submeshes
++                            [model.meshes[j as usize].submesh_index as usize + i as usize]
++                            .attribute_index_mask,
+                     });
+                 }
+ 
+@@ -1155,8 +1217,24 @@
+                         .push(mesh.vertex_buffer_strides[stream as usize] as usize);
+                 }
+ 
++                let bone_table: Vec<u16> = if model_file_header.version <= 0x1000005 {
++                    model
++                        .bone_tables
++                        .get(mesh.bone_table_index as usize)
++                        .map(|t| t.bone_indices[..t.bone_count.min(64) as usize].to_vec())
++                        .unwrap_or_default()
++                } else {
++                    model
++                        .bone_tables_v2
++                        .tables
++                        .get(mesh.bone_table_index as usize)
++                        .map(|t| t.bone_indices.clone())
++                        .unwrap_or_default()
++                };
++
+                 parts.push(Part {
+                     mesh_index: j,
++                    bone_table,
+                     part_type,
+                     vertices,
+                     indices,
+@@ -1177,6 +1255,7 @@
+             lods,
+             affected_bone_names,
+             material_names,
++            attribute_names,
+         })
+     }
+ }
+@@ -1255,11 +1334,10 @@
+                                             .ok()?;
+                                     }
+                                     _ => {
+-                                        panic!(
+-                                            "Unexpected vertex type for position: {:#?}",
+-                                            element.vertex_type
+-                                        );
+-                                    }
++                                    // FFLocal: vertex types this reader does not decode (mod tools
++                                    // write formats retail never uses) leave the position at its default
++                                    // instead of aborting the whole model.
++                                }
+                                 },
+                                 VertexUsage::BlendWeights => match element.vertex_type {
+                                     VertexType::ByteFloat4 => {
+@@ -1271,22 +1349,20 @@
+                                             .ok()?; // TODO: WRONG!
+                                     }
+                                     _ => {
+-                                        panic!(
+-                                            "Unexpected vertex type for blendweight: {:#?}",
+-                                            element.vertex_type
+-                                        );
+-                                    }
++                                    // FFLocal: vertex types this reader does not decode (mod tools
++                                    // write formats retail never uses) leave the blendweight at its default
++                                    // instead of aborting the whole model.
++                                }
+                                 },
+                                 VertexUsage::BlendIndices => match element.vertex_type {
+                                     VertexType::Byte4 => {
+                                         MDL::write_byte4(&mut cursor, &vert.bone_id).ok()?;
+                                     }
+                                     _ => {
+-                                        panic!(
+-                                            "Unexpected vertex type for blendindice: {:#?}",
+-                                            element.vertex_type
+-                                        );
+-                                    }
++                                    // FFLocal: vertex types this reader does not decode (mod tools
++                                    // write formats retail never uses) leave the blendindice at its default
++                                    // instead of aborting the whole model.
++                                }
+                                 },
+                                 VertexUsage::Normal => match element.vertex_type {
+                                     VertexType::Half4 => {
+@@ -1310,11 +1386,10 @@
+                                         .ok()?;
+                                     }
+                                     _ => {
+-                                        panic!(
+-                                            "Unexpected vertex type for normal: {:#?}",
+-                                            element.vertex_type
+-                                        );
+-                                    }
++                                    // FFLocal: vertex types this reader does not decode (mod tools
++                                    // write formats retail never uses) leave the normal at its default
++                                    // instead of aborting the whole model.
++                                }
+                                 },
+                                 VertexUsage::UV => match element.vertex_type {
+                                     VertexType::Half2 => {
+@@ -1342,22 +1417,20 @@
+                                         MDL::write_tangent(&mut cursor, &combined).ok()?;
+                                     }
+                                     _ => {
+-                                        panic!(
+-                                            "Unexpected vertex type for uv: {:#?}",
+-                                            element.vertex_type
+-                                        );
+-                                    }
++                                    // FFLocal: vertex types this reader does not decode (mod tools
++                                    // write formats retail never uses) leave the uv at its default
++                                    // instead of aborting the whole model.
++                                }
+                                 },
+                                 VertexUsage::BiTangent => match element.vertex_type {
+                                     VertexType::ByteFloat4 => {
+                                         MDL::write_tangent(&mut cursor, &vert.bitangent).ok()?;
+                                     }
+                                     _ => {
+-                                        panic!(
+-                                            "Unexpected vertex type for bitangent: {:#?}",
+-                                            element.vertex_type
+-                                        );
+-                                    }
++                                    // FFLocal: vertex types this reader does not decode (mod tools
++                                    // write formats retail never uses) leave the bitangent at its default
++                                    // instead of aborting the whole model.
++                                }
+                                 },
+                                 VertexUsage::Tangent => {
+                                     #[allow(clippy::match_single_binding)] // TODO
+@@ -1369,11 +1442,10 @@
+                                                 .ok()?;
+                                         }
+                                         _ => {
+-                                            panic!(
+-                                                "Unexpected vertex type for tangent: {:#?}",
+-                                                element.vertex_type
+-                                            );
+-                                        }
++                                    // FFLocal: vertex types this reader does not decode (mod tools
++                                    // write formats retail never uses) leave the tangent at its default
++                                    // instead of aborting the whole model.
++                                }
+                                     }
+                                 }
+                                 VertexUsage::Color => match element.vertex_type {
+@@ -1381,11 +1453,10 @@
+                                         MDL::write_byte_float4(&mut cursor, &vert.color).ok()?;
+                                     }
+                                     _ => {
+-                                        panic!(
+-                                            "Unexpected vertex type for color: {:#?}",
+-                                            element.vertex_type
+-                                        );
+-                                    }
++                                    // FFLocal: vertex types this reader does not decode (mod tools
++                                    // write formats retail never uses) leave the color at its default
++                                    // instead of aborting the whole model.
++                                }
+                                 },
+                             }
+                         }
+@@ -1439,6 +1510,8 @@
+         + self.header.shape_value_count as u32 * 4
+         + 4 // SubmeshBoneMapSize
+         + self.submesh_bone_map.len() as u32 * 2
++        + self.neck_morphs.len() as u32 * 32
++        + self.unknown_72_padding.len() as u32
+         + self.padding_amount as u32 + 1          // PaddingAmount and Padding
+         + (4 * 32) // 4 BoundingBoxes
+         + (self.header.bone_count as u32 * 32)
+diff --color -ruN -x target -x '*.orig' -x Cargo.lock physis-pristine/src/mtrl.rs physis-now/src/mtrl.rs
+--- a/src/mtrl.rs	2026-09-09 10:08:04.505297136 -0600
++++ b/src/mtrl.rs	2026-09-09 15:21:31.816318847 -0600
+@@ -338,9 +338,9 @@
+ #[repr(C)]
+ #[allow(dead_code)]
+ pub struct Constant {
+-    id: u32,
+-    num_values: u32,
+-    values: [f32; 4],
++    pub id: u32,
++    pub num_values: u32,
++    pub values: [f32; 4],
+ }
+ 
+ #[binrw]
+@@ -350,9 +350,11 @@
+ pub struct Sampler {
+     /// This is a CRC hash, it can be calculated via ShaderPackage::crc
+     pub texture_usage: u32,
+-    flags: u32, // TODO: unknown
++    /// Sampler state flags (wrap modes, LoD bias, etc.).
++    pub flags: u32,
++    /// Index into [Material::texture_paths].
+     #[brw(pad_after = 3)] // empty bytes/padding
+-    texture_index: u8,
++    pub texture_index: u8,
+ }
+ 
+ #[binrw::parser(reader, endian)]
+diff --color -ruN -x target -x '*.orig' -x Cargo.lock physis-pristine/src/pap.rs physis-now/src/pap.rs
+--- a/src/pap.rs	2026-09-09 10:08:04.505328086 -0600
++++ b/src/pap.rs	2026-09-09 15:21:31.815927901 -0600
+@@ -96,6 +96,13 @@
+     pub tmbs: Vec<Tmb>,
+ }
+ 
++impl Pap {
++    /// The raw Havok binary tag file embedded in this animation package.
++    pub fn havok_data(&self) -> &[u8] {
++        &self.havok_data
++    }
++}
++
+ impl ReadableFile for Pap {
+     fn from_existing(platform: Platform, buffer: ByteSpan) -> Option<Self> {
+         let mut cursor = Cursor::new(buffer);
+diff --color -ruN -x target -x '*.orig' -x Cargo.lock physis-pristine/src/race.rs physis-now/src/race.rs
+--- a/src/race.rs	2026-09-09 10:08:04.505346306 -0600
++++ b/src/race.rs	2026-09-09 15:21:31.815943281 -0600
+@@ -79,8 +79,8 @@
+             Gender::Female => Some(601),
+         },
+         Race::Lalafell => match gender {
+-            Gender::Male => Some(501),
+-            Gender::Female => Some(601),
++            Gender::Male => Some(1101),
++            Gender::Female => Some(1201),
+         },
+         Race::Miqote => match gender {
+             Gender::Male => Some(701),
+@@ -123,7 +123,7 @@
+         Race::Roegadyn => [Tribe::SeaWolf, Tribe::Hellsguard],
+         Race::AuRa => [Tribe::Raen, Tribe::Xaela],
+         Race::Hrothgar => [Tribe::Hellion, Tribe::Lost],
+-        Race::Viera => [Tribe::Raen, Tribe::Veena],
++        Race::Viera => [Tribe::Rava, Tribe::Veena],
+     }
+ }
+ 
+diff --color -ruN -x target -x '*.orig' -x Cargo.lock physis-pristine/src/skeleton.rs physis-now/src/skeleton.rs
+--- a/src/skeleton.rs	2026-09-09 10:08:04.505384637 -0600
++++ b/src/skeleton.rs	2026-09-09 15:21:31.816308537 -0600
+@@ -10,7 +10,7 @@
+ use std::io::{Cursor, SeekFrom};
+ 
+ use crate::common::Platform;
+-use crate::havok::{HavokAnimationContainer, HavokBinaryTagFileReader};
++use crate::havok::{HavokAnimationContainer, HavokBinaryTagFileReader, HavokSkeleton, HavokSkeletonMapper};
+ use crate::race::{Gender, Race, Tribe, get_race_id};
+ use crate::{ByteSpan, ReadableFile};
+ 
+@@ -51,7 +51,7 @@
+     raw_data: Vec<u8>,
+ }
+ 
+-#[derive(Debug)]
++#[derive(Debug, Clone)]
+ pub struct Bone {
+     /// Name of the bone
+     pub name: String,
+@@ -66,6 +66,47 @@
+     pub scale: [f32; 3],
+ }
+ 
++/// A bone mapping between two skeletons (from `hkaSkeletonMapper`), with bones resolved to
++/// names so it can be applied to any skeleton carrying the same bone names.
++#[derive(Debug, Clone)]
++pub struct SkeletonMapping {
++    /// Bone of the source skeleton (A).
++    pub bone_a: String,
++    /// Bone of this skeleton (B).
++    pub bone_b: String,
++    /// `M_B[b] = M_A[a] * a_from_b` in model space (translation, quaternion xyzw, scale).
++    pub a_from_b_translation: [f32; 3],
++    pub a_from_b_rotation: [f32; 4],
++    pub a_from_b_scale: [f32; 3],
++}
++
++#[derive(Debug, Clone)]
++pub struct SkeletonChainMapping {
++    pub start_bone_a: String,
++    pub end_bone_a: String,
++    pub start_bone_b: String,
++    pub end_bone_b: String,
++}
++
++/// A retargeting mapper embedded in a skeleton file: how poses of the source skeleton
++/// `source_bones` (usually the Midlander-male base `c0101`) map onto this skeleton.
++#[derive(Debug, Clone)]
++pub struct SkeletonMapper {
++    pub source_name: String,
++    /// The source skeleton's bones (name, parent index, rest pose), needed to build its
++    /// model-space pose from a clip.
++    pub source_bones: Vec<Bone>,
++    pub target_name: String,
++    pub simple_mappings: Vec<SkeletonMapping>,
++    pub chain_mappings: Vec<SkeletonChainMapping>,
++    pub unmapped_bones: Vec<String>,
++    pub keep_unmapped_local: bool,
++    /// 0 = ragdoll, 1 = retargeting.
++    pub mapping_type: i32,
++    /// This skeleton's bones as the mapper stores them (the mapper's skeleton B).
++    pub target_bones: Vec<Bone>,
++}
++
+ /// Skeleton file, usually with the `.sklb` file extension.
+ ///
+ /// Contains a tree of bones.
+@@ -73,6 +114,8 @@
+ pub struct Skeleton {
+     /// Bones of this skeleton
+     pub bones: Vec<Bone>,
++    /// Retargeting mappers embedded in the file (empty for the base skeleton).
++    pub mappers: Vec<SkeletonMapper>,
+ }
+ 
+ impl ReadableFile for Skeleton {
+@@ -87,7 +130,10 @@
+ 
+         let havok_skeleton = &animation_container.skeletons[0];
+ 
+-        let mut skeleton = Skeleton { bones: vec![] };
++        let mut skeleton = Skeleton {
++            bones: vec![],
++            mappers: vec![],
++        };
+ 
+         for (index, bone) in havok_skeleton.bone_names.iter().enumerate() {
+             skeleton.bones.push(Bone {
+@@ -107,6 +153,55 @@
+             });
+         }
+ 
++        for mapper in root.find_objects_by_type("hkaSkeletonMapper") {
++            let m = HavokSkeletonMapper::new(mapper);
++            let bones_of = |hs: &HavokSkeleton| -> Vec<Bone> {
++                hs.bone_names
++                    .iter()
++                    .enumerate()
++                    .map(|(i, name)| Bone {
++                        name: name.clone(),
++                        parent_index: hs.parent_indices[i] as i32,
++                        position: [hs.reference_pose[i].translation[0], hs.reference_pose[i].translation[1], hs.reference_pose[i].translation[2]],
++                        rotation: hs.reference_pose[i].rotation,
++                        scale: [hs.reference_pose[i].scale[0], hs.reference_pose[i].scale[1], hs.reference_pose[i].scale[2]],
++                    })
++                    .collect()
++            };
++            let name_a = |i: usize| m.skeleton_a.bone_names.get(i).cloned().unwrap_or_default();
++            let name_b = |i: usize| m.skeleton_b.bone_names.get(i).cloned().unwrap_or_default();
++            skeleton.mappers.push(SkeletonMapper {
++                source_name: m.skeleton_a.name.clone(),
++                source_bones: bones_of(&m.skeleton_a),
++                target_name: m.skeleton_b.name.clone(),
++                simple_mappings: m
++                    .simple_mappings
++                    .iter()
++                    .map(|sm| SkeletonMapping {
++                        bone_a: name_a(sm.bone_a),
++                        bone_b: name_b(sm.bone_b),
++                        a_from_b_translation: [sm.a_from_b.translation[0], sm.a_from_b.translation[1], sm.a_from_b.translation[2]],
++                        a_from_b_rotation: sm.a_from_b.rotation,
++                        a_from_b_scale: [sm.a_from_b.scale[0], sm.a_from_b.scale[1], sm.a_from_b.scale[2]],
++                    })
++                    .collect(),
++                chain_mappings: m
++                    .chain_mappings
++                    .iter()
++                    .map(|c| SkeletonChainMapping {
++                        start_bone_a: name_a(c.start_bone_a),
++                        end_bone_a: name_a(c.end_bone_a),
++                        start_bone_b: name_b(c.start_bone_b),
++                        end_bone_b: name_b(c.end_bone_b),
++                    })
++                    .collect(),
++                unmapped_bones: m.unmapped_bones.iter().map(|&i| name_b(i)).collect(),
++                keep_unmapped_local: m.keep_unmapped_local,
++                mapping_type: m.mapping_type,
++                target_bones: bones_of(&m.skeleton_b),
++            });
++        }
++
+         Some(skeleton)
+     }
+ }
+diff --color -ruN -x target -x '*.orig' -x Cargo.lock physis-pristine/src/sqpack/mod.rs physis-now/src/sqpack/mod.rs
+--- a/src/sqpack/mod.rs	2026-09-09 10:08:04.495929393 -0600
++++ b/src/sqpack/mod.rs	2026-09-09 15:21:31.816190825 -0600
+@@ -15,7 +15,7 @@
+ mod db;
+ pub use db::SqPackDatabase;
+ 
+-mod index;
++pub mod index;
+ pub use index::{Hash, IndexEntry, IndexType, SqPackIndex};
+ 
+ /// The type of this SqPack file.

@@ -1,0 +1,71 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/ffl-core",
+    "crates/ffl-hub",
+    "engines/ff14/assets",
+    "engines/ff14/chara",
+    "engines/ff14/engine",
+    "engines/ff11",
+    "crates/ffl-app",
+    "crates/ffl-cli",
+    "crates/ffl-launcher",
+]
+exclude = ["vendor/physis"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+rust-version = "1.95"
+repository = "https://github.com/VirstaXIV/FFLocal"
+
+[workspace.dependencies]
+ffl-core = { path = "crates/ffl-core" }
+ffl-hub = { path = "crates/ffl-hub" }
+ffl-ff14-assets = { path = "engines/ff14/assets" }
+ffl-ff14-chara = { path = "engines/ff14/chara" }
+ffl-ff14 = { path = "engines/ff14/engine" }
+ffl-ff11 = { path = "engines/ff11" }
+
+physis = "=0.6.0"
+bevy = { version = "0.19.1", features = ["wayland"] }
+avian3d = { version = "0.7.0", default-features = false, features = [
+    "3d",
+    "f32",
+    "parry-f32",
+    "debug-plugin",
+    "collider-from-mesh",
+    "parallel",
+] }
+bevy_egui = "0.42.0"
+# Must match bevy_egui's egui (the hub crate draws with egui directly, without Bevy).
+egui = "0.36"
+
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+tracing = "0.1"
+lewton = "0.10"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Physis 0.6.0 with FFLocal's small patches (bone tables, race codes, havok exposure).
+[patch.crates-io]
+physis = { path = "vendor/physis" }
+
+# Build cache size: dependencies (Bevy and friends) carry no debug info and our crates only
+# line tables, which keeps `target/` at a few GB instead of tens (full debug info for every
+# optimised dependency was 43 GB). `cargo clean` frees the cache; the app itself is ~130 MB.
+[profile.dev]
+opt-level = 1
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 3
+debug = false
+
+[profile.release]
+debug = "line-tables-only"

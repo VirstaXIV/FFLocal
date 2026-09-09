@@ -1,0 +1,13 @@
+[package]
+name = "ffl-ff11"
+description = "FFXI engine for FFLocal: reads zone DATs (MZB/MMB/IMG) in place from the installed game."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ffl-core.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+glam = "0.33"
